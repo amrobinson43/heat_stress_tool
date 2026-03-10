@@ -1,11 +1,15 @@
 import os
+import io
 import json
 import math
 import pickle
+import uuid
 from datetime import datetime
 
 import numpy as np
-import streamlit as st
+from flask import Flask, render_template, request, send_file, url_for
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 
@@ -15,16 +19,8 @@ try:
 except Exception:
     rasterio = None
 
-# ================================
-# Page config
-# ================================
-st.set_page_config(page_title="Afternoon Heat Stress Prediction Tool", layout="wide")
 
-st.title("Afternoon Heat Stress Prediction Tool")
-st.write(
-    "Predict afternoon temperature, dew point, solar radiation, 2 m wind speed, pressure, "
-    "WBGT, black globe temperature, and natural wet bulb temperature from at-observation inputs."
-)
+app = Flask(__name__)
 
 # ================================
 # Constants
@@ -55,12 +51,15 @@ R = 287.05
 g = 9.80665
 
 # ================================
-# Relative paths for deployment
+# Paths
 # ================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 MODEL_DIR = os.path.join(DATA_DIR, "models")
 RASTER_DIR = os.path.join(DATA_DIR, "rasters")
+OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 TEMP_MAX_PKL = os.path.join(MODEL_DIR, "atobs_orange_temp_max.pkl")
 TEMP_MIN_PKL = os.path.join(MODEL_DIR, "atobs_orange_temp_min.pkl")
@@ -82,13 +81,20 @@ ATOBS_FEATURES = [
 ]
 
 # ================================
+# Cached global objects
+# ================================
+MODELS = None
+RASTERS = None
+
+
+# ================================
 # Helpers
 # ================================
 def load_pickle(path):
     with open(path, "rb") as f:
         return pickle.load(f)
 
-@st.cache_resource
+
 def load_models():
     return {
         "temp_max": load_pickle(TEMP_MAX_PKL),
@@ -98,16 +104,18 @@ def load_models():
         "sol_max": load_pickle(SOL_MAX_PKL) if os.path.exists(SOL_MAX_PKL) else None,
     }
 
+
 def read_raster(path):
     with rasterio.open(path) as src:
         arr = src.read(1).astype(np.float32)
         meta = src.meta.copy()
     return arr, meta
 
-@st.cache_data
+
 def load_rasters():
     if rasterio is None:
         raise RuntimeError("rasterio is not installed.")
+
     rasters = {}
     rasters["ta_z"], rasters["meta"] = read_raster(TA_Z_TIF)
     rasters["td_z"], _ = read_raster(TD_Z_TIF) if os.path.exists(TD_Z_TIF) else (None, None)
@@ -115,6 +123,15 @@ def load_rasters():
     rasters["z0"], rasters["z0_meta"] = read_raster(ROUGHNESS_TIF) if os.path.exists(ROUGHNESS_TIF) else (None, None)
     rasters["elev"], rasters["elev_meta"] = read_raster(ELEV_TIF) if os.path.exists(ELEV_TIF) else (None, None)
     return rasters
+
+
+def ensure_loaded():
+    global MODELS, RASTERS
+    if MODELS is None:
+        MODELS = load_models()
+    if RASTERS is None:
+        RASTERS = load_rasters()
+
 
 def align_to_template(src_arr, src_meta, tmpl_meta, resampling=Resampling.bilinear):
     dst_arr = np.empty((tmpl_meta["height"], tmpl_meta["width"]), dtype=np.float32)
@@ -130,14 +147,17 @@ def align_to_template(src_arr, src_meta, tmpl_meta, resampling=Resampling.biline
     )
     return dst_arr
 
+
 def z_to_01(z):
     z_clipped = np.clip(np.where(np.isfinite(z), z, 0), -20, 20)
     out = 1.0 / (1.0 + np.exp(-z_clipped))
     out[~np.isfinite(z)] = np.nan
     return out
 
+
 def scale_map(mod01, vmin, vmax):
     return (mod01 * (vmax - vmin)) + vmin
+
 
 def downscale_wind_factor_z0(z0, z=2.0, zref=10.0):
     z0_eff = np.clip(z0.astype(np.float32), 1e-4, 1.5)
@@ -148,12 +168,15 @@ def downscale_wind_factor_z0(z0, z=2.0, zref=10.0):
     f = np.where(np.isfinite(f) & (f > 0), f, np.nan)
     return f
 
+
 def compute_u2_from_u10_and_z0(u10_ms, z0_aligned):
     return u10_ms * downscale_wind_factor_z0(z0_aligned, z=2.0, zref=10.0)
+
 
 def calculate_pressure(elevation_m, temperature_c, ref_pressure_mb, ref_elevation_m):
     temperature_k = temperature_c + 273.15
     return ref_pressure_mb * np.exp(-g * (elevation_m - ref_elevation_m) / (R * temperature_k))
+
 
 def esat(tk, phase=0):
     if phase == 0:
@@ -162,11 +185,14 @@ def esat(tk, phase=0):
     y = (tk - 273.15) / (tk - 0.6)
     return 6.1115 * np.exp(22.452 * y)
 
+
 def viscosity(tk):
     return 1.458e-6 * tk**1.5 / (tk + 110.4)
 
+
 def thermal_cond(tk):
     return (Cp + 1.25 * R_AIR) * viscosity(tk)
+
 
 def h_cylinder(diameter, tk, pair_mb, speed):
     density = pair_mb * 100.0 / (R_AIR * tk)
@@ -174,19 +200,24 @@ def h_cylinder(diameter, tk, pair_mb, speed):
     nu = 0.281 * re**(1.0 - 0.4) * Pr**(1.0 - 0.56)
     return nu * thermal_cond(tk) / diameter
 
+
 def emis_atm(tair_k, rh_frac):
     e = rh_frac * esat(tair_k)
     return 0.575 * e**0.143
 
+
 def evap(tk):
     return (313.15 - tk) / 30.0 * (-71100.0) + 2.4073e6
+
 
 def solar_declination(day_of_year):
     return math.radians(23.44) * math.sin(math.radians(360 / 365 * (day_of_year - 81)))
 
+
 def equation_of_time(day_of_year):
     B = math.radians(360 / 365 * (day_of_year - 81))
     return 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)
+
 
 def solar_zenith_cos(lat_deg, lon_deg, dt_local):
     day_of_year = dt_local.timetuple().tm_yday
@@ -199,8 +230,10 @@ def solar_zenith_cos(lat_deg, lon_deg, dt_local):
     cza = math.sin(lat_rad) * math.sin(decl) + math.cos(lat_rad) * math.cos(decl) * math.cos(hour_angle)
     return max(cza, 0.00873)
 
+
 def calculate_smax(solar_constant, cza, distance_au=1.0):
     return solar_constant * cza / (distance_au ** 2) if cza > 0 else 0.0
+
 
 def calculate_fdir(solar, smax):
     solar = np.asarray(solar, dtype=float)
@@ -212,6 +245,7 @@ def calculate_fdir(solar, smax):
     out[mask] = np.exp(3.0 - 1.34 * s_star[mask] - 1.65 / s_star[mask])
     np.clip(out, 0.0, 1.0, out=out)
     return out
+
 
 def tg_iter(tair_k, rh_frac, pair_mb, speed_ms, solar_wm2, fdir, cza):
     tsfc = tair_k
@@ -231,6 +265,7 @@ def tg_iter(tair_k, rh_frac, pair_mb, speed_ms, solar_wm2, fdir, cza):
         tglobe = 0.9 * tglobe + 0.1 * new
     return np.nan
 
+
 def tnw_iter(tair_k, rh_frac, pair_mb, speed_ms, solar_wm2, fdir, cza):
     eair = rh_frac * esat(tair_k)
     z = np.log(max(eair, 1e-6) / (6.1121 * 1.004))
@@ -246,6 +281,7 @@ def tnw_iter(tair_k, rh_frac, pair_mb, speed_ms, solar_wm2, fdir, cza):
             return new
         twb = 0.9 * twb + 0.1 * new
     return np.nan
+
 
 def wbgt_from_fields(tair_c, td_c, solar_wm2, pair_mb, speed_ms, dt_local, lat=SITE_LAT, lon=SITE_LON):
     rh_pct = 100.0 * (
@@ -287,22 +323,27 @@ def wbgt_from_fields(tair_c, td_c, solar_wm2, pair_mb, speed_ms, dt_local, lat=S
 
     return wbgt_k, tg_k, tnw_k
 
-def show_map(arr, title, cmap="viridis"):
+
+def save_map(arr, title, out_path, cmap="viridis"):
     fig, ax = plt.subplots(figsize=(7, 6))
     im = ax.imshow(arr, cmap=cmap)
     ax.set_title(title)
     ax.set_xticks([])
     ax.set_yticks([])
     plt.colorbar(im, ax=ax, shrink=0.8)
-    st.pyplot(fig)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
-def show_flag_map(wbgt_array, unit="C"):
+
+def save_flag_map(wbgt_array, out_path, unit="C"):
     if unit.upper() == "F":
         bounds = [0, 80, 85, 88, 90, 120]
         title = "WBGT Flag Levels (°F)"
     else:
         bounds = [0.0, 26.7, 29.4, 31.1, 32.2, 50.0]
         title = "WBGT Flag Levels (°C)"
+
     colors = ["white", "green", "yellow", "red", "black"]
     cmap = ListedColormap(colors)
     norm = BoundaryNorm(bounds, cmap.N)
@@ -313,175 +354,244 @@ def show_flag_map(wbgt_array, unit="C"):
     ax.set_xticks([])
     ax.set_yticks([])
     plt.colorbar(im, ax=ax, shrink=0.8, ticks=bounds)
-    st.pyplot(fig)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def make_output_name(prefix):
+    return f"{prefix}_{uuid.uuid4().hex[:12]}.png"
+
+
+def cleanup_old_outputs(max_files=100):
+    files = [
+        os.path.join(OUTPUT_DIR, f)
+        for f in os.listdir(OUTPUT_DIR)
+        if f.lower().endswith(".png")
+    ]
+    if len(files) <= max_files:
+        return
+    files.sort(key=os.path.getmtime)
+    for f in files[:-max_files]:
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+
 
 # ================================
-# Sidebar inputs
+# Routes
 # ================================
-st.sidebar.header("Inputs")
+@app.route("/", methods=["GET", "POST"])
+def index():
+    error = None
+    result = None
 
-era_tair = st.sidebar.number_input("Air temperature at observation (°C)", value=32.0)
-era_dpt = st.sidebar.number_input("Dew point at observation (°C)", value=22.0)
-era_wspd = st.sidebar.number_input("Wind speed at 10 m (m/s)", value=2.5)
-era_cloud = st.sidebar.number_input("Cloud cover (%)", value=35.0, min_value=0.0, max_value=100.0)
-ref_pressure_mb = st.sidebar.number_input("Reference mean surface pressure (mb)", value=1008.0)
+    defaults = {
+        "era_tair": 32.0,
+        "era_dpt": 22.0,
+        "era_wspd": 2.5,
+        "era_cloud": 35.0,
+        "ref_pressure_mb": 1008.0,
+        "date_val": datetime.now().strftime("%Y-%m-%d"),
+        "time_val": datetime.now().strftime("%H:%M"),
+    }
 
-date_val = st.sidebar.date_input("Local date", value=datetime.now().date())
-time_val = st.sidebar.time_input("Local time", value=datetime.now().time())
+    form_data = defaults.copy()
 
-run_button = st.sidebar.button("Run prediction")
+    if request.method == "POST":
+        form_data["era_tair"] = request.form.get("era_tair", "32.0")
+        form_data["era_dpt"] = request.form.get("era_dpt", "22.0")
+        form_data["era_wspd"] = request.form.get("era_wspd", "2.5")
+        form_data["era_cloud"] = request.form.get("era_cloud", "35.0")
+        form_data["ref_pressure_mb"] = request.form.get("ref_pressure_mb", "1008.0")
+        form_data["date_val"] = request.form.get("date_val", defaults["date_val"])
+        form_data["time_val"] = request.form.get("time_val", defaults["time_val"])
 
-# ================================
-# Main run
-# ================================
-if run_button:
-    if rasterio is None:
-        st.error("rasterio is required for this app and is not installed.")
-        st.stop()
+        try:
+            if rasterio is None:
+                raise RuntimeError("rasterio is required for this app and is not installed.")
 
-    try:
-        models = load_models()
-        rasters = load_rasters()
-    except Exception as e:
-        st.error(f"Failed to load models or rasters: {e}")
-        st.stop()
+            ensure_loaded()
 
-    dt_local = datetime.combine(date_val, time_val)
-    X = np.array([[era_tair, era_dpt, era_wspd, era_cloud]], dtype=float)
+            era_tair = float(form_data["era_tair"])
+            era_dpt = float(form_data["era_dpt"])
+            era_wspd = float(form_data["era_wspd"])
+            era_cloud = float(form_data["era_cloud"])
+            ref_pressure_mb = float(form_data["ref_pressure_mb"])
+            dt_local = datetime.strptime(
+                f'{form_data["date_val"]} {form_data["time_val"]}',
+                "%Y-%m-%d %H:%M"
+            )
 
-    try:
-        t_max = float(models["temp_max"].predict(X)[0])
-        t_min = float(models["temp_min"].predict(X)[0])
+            X = np.array([[era_tair, era_dpt, era_wspd, era_cloud]], dtype=float)
 
-        d_max = float(models["dew_max"].predict(X)[0]) if models["dew_max"] is not None else None
-        d_min = float(models["dew_min"].predict(X)[0]) if models["dew_min"] is not None else None
-        s_max = float(models["sol_max"].predict(X)[0]) if models["sol_max"] is not None else None
-    except Exception as e:
-        st.error(f"Prediction failed: {e}")
-        st.stop()
+            t_max = float(MODELS["temp_max"].predict(X)[0])
+            t_min = float(MODELS["temp_min"].predict(X)[0])
 
-    ta_w = z_to_01(rasters["ta_z"])
-    temp_map = scale_map(ta_w, t_min, t_max)
+            d_max = float(MODELS["dew_max"].predict(X)[0]) if MODELS["dew_max"] is not None else None
+            d_min = float(MODELS["dew_min"].predict(X)[0]) if MODELS["dew_min"] is not None else None
+            s_max = float(MODELS["sol_max"].predict(X)[0]) if MODELS["sol_max"] is not None else None
 
-    dew_map = None
-    if rasters["td_z"] is not None and d_min is not None and d_max is not None:
-        td_w = z_to_01(rasters["td_z"])
-        dew_map = scale_map(td_w, d_min, d_max)
+            ta_w = z_to_01(RASTERS["ta_z"])
+            temp_map = scale_map(ta_w, t_min, t_max)
 
-    sol_map = None
-    if rasters["sol_z"] is not None and s_max is not None:
-        sol_w = z_to_01(rasters["sol_z"])
-        sol_map = scale_map(sol_w, 0.0, s_max)
+            dew_map = None
+            if RASTERS["td_z"] is not None and d_min is not None and d_max is not None:
+                td_w = z_to_01(RASTERS["td_z"])
+                dew_map = scale_map(td_w, d_min, d_max)
 
-    u2_map = None
-    if rasters["z0"] is not None:
-        z0_arr = rasters["z0"]
-        z0_meta = rasters["z0_meta"]
-        tmpl_meta = rasters["meta"]
-        needs_align = (
-            (z0_meta["crs"] != tmpl_meta["crs"]) or
-            (z0_meta["transform"] != tmpl_meta["transform"]) or
-            (z0_meta["width"] != tmpl_meta["width"]) or
-            (z0_meta["height"] != tmpl_meta["height"])
-        )
-        z0_aligned = align_to_template(z0_arr, z0_meta, tmpl_meta) if needs_align else z0_arr
-        u2_map = compute_u2_from_u10_and_z0(era_wspd, z0_aligned)
+            sol_map = None
+            if RASTERS["sol_z"] is not None and s_max is not None:
+                sol_w = z_to_01(RASTERS["sol_z"])
+                sol_map = scale_map(sol_w, 0.0, s_max)
 
-    pressure_map = None
-    if rasters["elev"] is not None:
-        elev_arr = rasters["elev"]
-        elev_meta = rasters["elev_meta"]
-        tmpl_meta = rasters["meta"]
-        needs_align = (
-            (elev_meta["crs"] != tmpl_meta["crs"]) or
-            (elev_meta["transform"] != tmpl_meta["transform"]) or
-            (elev_meta["width"] != tmpl_meta["width"]) or
-            (elev_meta["height"] != tmpl_meta["height"])
-        )
-        elev_aligned = align_to_template(elev_arr, elev_meta, tmpl_meta) if needs_align else elev_arr
-        ref_elevation_m = float(np.nanmean(elev_aligned))
-        pressure_map = calculate_pressure(elev_aligned, temp_map, ref_pressure_mb, ref_elevation_m)
+            u2_map = None
+            if RASTERS["z0"] is not None:
+                z0_arr = RASTERS["z0"]
+                z0_meta = RASTERS["z0_meta"]
+                tmpl_meta = RASTERS["meta"]
+                needs_align = (
+                    (z0_meta["crs"] != tmpl_meta["crs"]) or
+                    (z0_meta["transform"] != tmpl_meta["transform"]) or
+                    (z0_meta["width"] != tmpl_meta["width"]) or
+                    (z0_meta["height"] != tmpl_meta["height"])
+                )
+                z0_aligned = align_to_template(z0_arr, z0_meta, tmpl_meta) if needs_align else z0_arr
+                u2_map = compute_u2_from_u10_and_z0(era_wspd, z0_aligned)
 
-    st.subheader("Synoptic predictions")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Temperature min (°C)", f"{t_min:.2f}")
-    c1.metric("Temperature max (°C)", f"{t_max:.2f}")
-    c2.metric("Dew point min (°C)", "NA" if d_min is None else f"{d_min:.2f}")
-    c2.metric("Dew point max (°C)", "NA" if d_max is None else f"{d_max:.2f}")
-    c3.metric("Solar max (W/m²)", "NA" if s_max is None else f"{s_max:.1f}")
+            pressure_map = None
+            if RASTERS["elev"] is not None:
+                elev_arr = RASTERS["elev"]
+                elev_meta = RASTERS["elev_meta"]
+                tmpl_meta = RASTERS["meta"]
+                needs_align = (
+                    (elev_meta["crs"] != tmpl_meta["crs"]) or
+                    (elev_meta["transform"] != tmpl_meta["transform"]) or
+                    (elev_meta["width"] != tmpl_meta["width"]) or
+                    (elev_meta["height"] != tmpl_meta["height"])
+                )
+                elev_aligned = align_to_template(elev_arr, elev_meta, tmpl_meta) if needs_align else elev_arr
+                ref_elevation_m = float(np.nanmean(elev_aligned))
+                pressure_map = calculate_pressure(elev_aligned, temp_map, ref_pressure_mb, ref_elevation_m)
 
-    st.subheader("Continuous fields")
-    col1, col2 = st.columns(2)
-    with col1:
-        show_map(temp_map, "Temperature (°C)", cmap="coolwarm")
-        if dew_map is not None:
-            show_map(dew_map, "Dew Point (°C)", cmap="BrBG")
-        if u2_map is not None:
-            show_map(u2_map, "Wind Speed at 2 m (m/s)", cmap="viridis")
-    with col2:
-        if sol_map is not None:
-            show_map(sol_map, "Solar Radiation (W/m²)", cmap="inferno")
-        if pressure_map is not None:
-            show_map(pressure_map, "Surface Pressure (mb)", cmap="viridis")
+            image_urls = {}
 
-    if dew_map is not None and sol_map is not None and u2_map is not None and pressure_map is not None:
-        st.subheader("WBGT fields")
+            temp_name = make_output_name("temp")
+            save_map(temp_map, "Temperature (°C)", os.path.join(OUTPUT_DIR, temp_name), cmap="coolwarm")
+            image_urls["temp_map"] = url_for("output_file", filename=temp_name)
 
-        wbgt_k, tg_k, tnw_k = wbgt_from_fields(
-            tair_c=temp_map,
-            td_c=dew_map,
-            solar_wm2=sol_map,
-            pair_mb=pressure_map,
-            speed_ms=u2_map,
-            dt_local=dt_local,
-            lat=SITE_LAT,
-            lon=SITE_LON,
-        )
+            if dew_map is not None:
+                dew_name = make_output_name("dew")
+                save_map(dew_map, "Dew Point (°C)", os.path.join(OUTPUT_DIR, dew_name), cmap="BrBG")
+                image_urls["dew_map"] = url_for("output_file", filename=dew_name)
 
-        wbgt_c = wbgt_k - 273.15
-        tg_c = tg_k - 273.15
-        tnw_c = tnw_k - 273.15
-        wbgt_f = wbgt_c * 9 / 5 + 32
+            if sol_map is not None:
+                sol_name = make_output_name("solar")
+                save_map(sol_map, "Solar Radiation (W/m²)", os.path.join(OUTPUT_DIR, sol_name), cmap="inferno")
+                image_urls["sol_map"] = url_for("output_file", filename=sol_name)
 
-        col3, col4 = st.columns(2)
-        with col3:
-            show_map(wbgt_c, "WBGT (°C)", cmap="bwr")
-            show_map(tg_c, "Black Globe Temperature (°C)", cmap="Reds")
-        with col4:
-            show_map(tnw_c, "Natural Wet Bulb Temperature (°C)", cmap="BrBG")
-            show_flag_map(wbgt_c, unit="C")
+            if u2_map is not None:
+                wind_name = make_output_name("wind")
+                save_map(u2_map, "Wind Speed at 2 m (m/s)", os.path.join(OUTPUT_DIR, wind_name), cmap="viridis")
+                image_urls["u2_map"] = url_for("output_file", filename=wind_name)
 
-        st.subheader("WBGT flag map (°F)")
-        show_flag_map(wbgt_f, unit="F")
+            if pressure_map is not None:
+                pressure_name = make_output_name("pressure")
+                save_map(pressure_map, "Surface Pressure (mb)", os.path.join(OUTPUT_DIR, pressure_name), cmap="viridis")
+                image_urls["pressure_map"] = url_for("output_file", filename=pressure_name)
 
-        summary = {
-            "run_at": datetime.utcnow().isoformat() + "Z",
-            "inputs": {
-                "era_tair_C_at_obs": era_tair,
-                "era_dpt_C_at_obs": era_dpt,
-                "era_wspd_ms_at_obs": era_wspd,
-                "era_cloud_pct_at_obs": era_cloud,
-                "ref_pressure_mb": ref_pressure_mb,
-                "wbgt_time_local": dt_local.strftime("%Y-%m-%d %H:%M"),
-            },
-            "synoptic_predictions": {
-                "temp_max_C": t_max,
-                "temp_min_C": t_min,
-                "dew_max_C": d_max,
-                "dew_min_C": d_min,
-                "sol_max_Wm2": s_max,
-            },
-        }
+            wbgt_available = (
+                dew_map is not None and
+                sol_map is not None and
+                u2_map is not None and
+                pressure_map is not None
+            )
 
-        st.subheader("Summary JSON")
-        st.json(summary)
-        st.download_button(
-            "Download summary.json",
-            data=json.dumps(summary, indent=2),
-            file_name="prediction_summary.json",
-            mime="application/json",
-        )
-    else:
+            wbgt_warning = None
+            summary = {
+                "run_at": datetime.utcnow().isoformat() + "Z",
+                "inputs": {
+                    "era_tair_C_at_obs": era_tair,
+                    "era_dpt_C_at_obs": era_dpt,
+                    "era_wspd_ms_at_obs": era_wspd,
+                    "era_cloud_pct_at_obs": era_cloud,
+                    "ref_pressure_mb": ref_pressure_mb,
+                    "wbgt_time_local": dt_local.strftime("%Y-%m-%d %H:%M"),
+                },
+                "synoptic_predictions": {
+                    "temp_max_C": t_max,
+                    "temp_min_C": t_min,
+                    "dew_max_C": d_max,
+                    "dew_min_C": d_min,
+                    "sol_max_Wm2": s_max,
+                },
+            }
 
-        st.warning("WBGT step skipped because one or more required rasters or models are missing.")
+            if wbgt_available:
+                wbgt_k, tg_k, tnw_k = wbgt_from_fields(
+                    tair_c=temp_map,
+                    td_c=dew_map,
+                    solar_wm2=sol_map,
+                    pair_mb=pressure_map,
+                    speed_ms=u2_map,
+                    dt_local=dt_local,
+                    lat=SITE_LAT,
+                    lon=SITE_LON,
+                )
+
+                wbgt_c = wbgt_k - 273.15
+                tg_c = tg_k - 273.15
+                tnw_c = tnw_k - 273.15
+                wbgt_f = wbgt_c * 9 / 5 + 32
+
+                wbgt_name = make_output_name("wbgt")
+                save_map(wbgt_c, "WBGT (°C)", os.path.join(OUTPUT_DIR, wbgt_name), cmap="bwr")
+                image_urls["wbgt_map"] = url_for("output_file", filename=wbgt_name)
+
+                tg_name = make_output_name("tg")
+                save_map(tg_c, "Black Globe Temperature (°C)", os.path.join(OUTPUT_DIR, tg_name), cmap="Reds")
+                image_urls["tg_map"] = url_for("output_file", filename=tg_name)
+
+                tnw_name = make_output_name("tnw")
+                save_map(tnw_c, "Natural Wet Bulb Temperature (°C)", os.path.join(OUTPUT_DIR, tnw_name), cmap="BrBG")
+                image_urls["tnw_map"] = url_for("output_file", filename=tnw_name)
+
+                flag_c_name = make_output_name("flag_c")
+                save_flag_map(wbgt_c, os.path.join(OUTPUT_DIR, flag_c_name), unit="C")
+                image_urls["flag_c_map"] = url_for("output_file", filename=flag_c_name)
+
+                flag_f_name = make_output_name("flag_f")
+                save_flag_map(wbgt_f, os.path.join(OUTPUT_DIR, flag_f_name), unit="F")
+                image_urls["flag_f_map"] = url_for("output_file", filename=flag_f_name)
+            else:
+                wbgt_warning = "WBGT step skipped because one or more required rasters or models are missing."
+
+            cleanup_old_outputs()
+
+            result = {
+                "summary": summary,
+                "synoptic_predictions": summary["synoptic_predictions"],
+                "image_urls": image_urls,
+                "wbgt_warning": wbgt_warning,
+            }
+
+        except Exception as e:
+            error = str(e)
+
+    return render_template(
+        "index.html",
+        form_data=form_data,
+        result=result,
+        error=error
+    )
+
+
+@app.route("/outputs/<path:filename>")
+def output_file(filename):
+    return send_file(os.path.join(OUTPUT_DIR, filename))
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
 
