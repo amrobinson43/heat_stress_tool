@@ -14,8 +14,19 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 try:
     import rasterio
     from rasterio.warp import reproject, Resampling
+    from rasterio.transform import array_bounds
 except Exception:
     rasterio = None
+
+try:
+    import geopandas as gpd
+except Exception:
+    gpd = None
+
+try:
+    from shapely.geometry import box
+except Exception:
+    box = None
 
 
 app = Flask(__name__)
@@ -58,6 +69,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 MODEL_DIR = os.path.join(DATA_DIR, "models")
 RASTER_DIR = os.path.join(DATA_DIR, "rasters")
+ROADS_DIR = os.path.join(DATA_DIR, "roads")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -74,6 +86,8 @@ SOL_Z_TIF = os.path.join(RASTER_DIR, "sr_z_orange.tif")
 ROUGHNESS_TIF = os.path.join(RASTER_DIR, "surface_roughness.tif")
 ELEV_TIF = os.path.join(RASTER_DIR, "terrain.tif")
 
+ROADS_SHP = os.path.join(ROADS_DIR, "roads.shp")
+
 ATOBS_FEATURES = [
     "era_tair_C_at_obs",
     "era_dpt_C_at_obs",
@@ -86,6 +100,7 @@ ATOBS_FEATURES = [
 # ================================
 MODELS = None
 RASTERS = None
+ROADS = None
 
 # ================================
 # Integrated HTML template
@@ -617,12 +632,48 @@ def load_rasters():
     return rasters
 
 
+def load_roads(template_meta):
+    if gpd is None:
+        return None
+
+    if not os.path.exists(ROADS_SHP):
+        return None
+
+    roads = gpd.read_file(ROADS_SHP)
+
+    if roads.empty:
+        return None
+
+    target_crs = template_meta.get("crs", None)
+    if target_crs is not None and roads.crs is not None and roads.crs != target_crs:
+        roads = roads.to_crs(target_crs)
+
+    if box is not None:
+        west, south, east, north = array_bounds(
+            template_meta["height"],
+            template_meta["width"],
+            template_meta["transform"]
+        )
+        bbox = box(west, south, east, north)
+        try:
+            roads = roads.clip(bbox)
+        except Exception:
+            roads = roads[roads.intersects(bbox)]
+
+    if roads.empty:
+        return None
+
+    return roads
+
+
 def ensure_loaded():
-    global MODELS, RASTERS
+    global MODELS, RASTERS, ROADS
     if MODELS is None:
         MODELS = load_models()
     if RASTERS is None:
         RASTERS = load_rasters()
+    if ROADS is None:
+        ROADS = load_roads(RASTERS["meta"])
 
 
 def align_to_template(src_arr, src_meta, tmpl_meta, resampling=Resampling.bilinear):
@@ -816,9 +867,41 @@ def wbgt_from_fields(tair_c, td_c, solar_wm2, pair_mb, speed_ms, dt_local, lat=S
     return wbgt_k, tg_k, tnw_k
 
 
-def save_map(arr, title, out_path, cmap="viridis"):
+def plot_roads(ax, roads_gdf):
+    if roads_gdf is None:
+        return
+    try:
+        roads_gdf.plot(
+            ax=ax,
+            color="black",
+            linewidth=0.35,
+            alpha=0.7,
+            zorder=5
+        )
+    except Exception:
+        pass
+
+
+def save_map(arr, title, out_path, meta=None, roads_gdf=None, cmap="Greys"):
     fig, ax = plt.subplots(figsize=(7, 6))
-    im = ax.imshow(arr, cmap=cmap)
+
+    if meta is not None and rasterio is not None:
+        west, south, east, north = array_bounds(
+            meta["height"],
+            meta["width"],
+            meta["transform"]
+        )
+        im = ax.imshow(
+            arr,
+            cmap=cmap,
+            extent=[west, east, south, north],
+            origin="upper"
+        )
+    else:
+        im = ax.imshow(arr, cmap=cmap)
+
+    plot_roads(ax, roads_gdf)
+
     ax.set_title(title)
     ax.set_xticks([])
     ax.set_yticks([])
@@ -828,7 +911,7 @@ def save_map(arr, title, out_path, cmap="viridis"):
     plt.close(fig)
 
 
-def save_flag_map(wbgt_array, out_path, unit="C"):
+def save_flag_map(wbgt_array, out_path, unit="C", meta=None, roads_gdf=None):
     if unit.upper() == "F":
         bounds = [0, 80, 85, 88, 90, 120]
         title = "WBGT Flag Levels (°F)"
@@ -841,7 +924,25 @@ def save_flag_map(wbgt_array, out_path, unit="C"):
     norm = BoundaryNorm(bounds, cmap.N)
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    im = ax.imshow(wbgt_array, cmap=cmap, norm=norm)
+
+    if meta is not None and rasterio is not None:
+        west, south, east, north = array_bounds(
+            meta["height"],
+            meta["width"],
+            meta["transform"]
+        )
+        im = ax.imshow(
+            wbgt_array,
+            cmap=cmap,
+            norm=norm,
+            extent=[west, east, south, north],
+            origin="upper"
+        )
+    else:
+        im = ax.imshow(wbgt_array, cmap=cmap, norm=norm)
+
+    plot_roads(ax, roads_gdf)
+
     ax.set_title(title)
     ax.set_xticks([])
     ax.set_yticks([])
@@ -1009,6 +1110,8 @@ def index():
                 temp_map_display,
                 f"Temperature ({temp_unit})",
                 os.path.join(OUTPUT_DIR, temp_name),
+                meta=RASTERS["meta"],
+                roads_gdf=ROADS,
                 cmap="coolwarm"
             )
             image_urls["temp_map"] = {
@@ -1022,6 +1125,8 @@ def index():
                     dew_map_display,
                     f"Dew Point ({temp_unit})",
                     os.path.join(OUTPUT_DIR, dew_name),
+                    meta=RASTERS["meta"],
+                    roads_gdf=ROADS,
                     cmap="BrBG"
                 )
                 image_urls["dew_map"] = {
@@ -1035,7 +1140,9 @@ def index():
                     sol_map,
                     "Solar Radiation (W/m²)",
                     os.path.join(OUTPUT_DIR, sol_name),
-                    cmap="inferno"
+                    meta=RASTERS["meta"],
+                    roads_gdf=ROADS,
+                    cmap="Reds"
                 )
                 image_urls["sol_map"] = {
                     "url": url_for("output_file", filename=sol_name),
@@ -1048,7 +1155,9 @@ def index():
                     u2_map_display,
                     f"Wind Speed at 2 m ({wind_unit})",
                     os.path.join(OUTPUT_DIR, wind_name),
-                    cmap="viridis"
+                    meta=RASTERS["meta"],
+                    roads_gdf=ROADS,
+                    cmap="Blues"
                 )
                 image_urls["u2_map"] = {
                     "url": url_for("output_file", filename=wind_name),
@@ -1061,6 +1170,8 @@ def index():
                     pressure_map,
                     "Surface Pressure (mb)",
                     os.path.join(OUTPUT_DIR, pressure_name),
+                    meta=RASTERS["meta"],
+                    roads_gdf=ROADS,
                     cmap="viridis"
                 )
                 image_urls["pressure_map"] = {
@@ -1148,6 +1259,8 @@ def index():
                     wbgt_display,
                     f"WBGT ({temp_unit})",
                     os.path.join(OUTPUT_DIR, wbgt_name),
+                    meta=RASTERS["meta"],
+                    roads_gdf=ROADS,
                     cmap="bwr"
                 )
                 image_urls["wbgt_map"] = {
@@ -1160,6 +1273,8 @@ def index():
                     tg_display,
                     f"Black Globe Temperature ({temp_unit})",
                     os.path.join(OUTPUT_DIR, tg_name),
+                    meta=RASTERS["meta"],
+                    roads_gdf=ROADS,
                     cmap="Reds"
                 )
                 image_urls["tg_map"] = {
@@ -1172,6 +1287,8 @@ def index():
                     tnw_display,
                     f"Natural Wet Bulb Temperature ({temp_unit})",
                     os.path.join(OUTPUT_DIR, tnw_name),
+                    meta=RASTERS["meta"],
+                    roads_gdf=ROADS,
                     cmap="BrBG"
                 )
                 image_urls["tnw_map"] = {
@@ -1183,7 +1300,9 @@ def index():
                 save_flag_map(
                     wbgt_display,
                     os.path.join(OUTPUT_DIR, flag_name),
-                    unit=flag_unit
+                    unit=flag_unit,
+                    meta=RASTERS["meta"],
+                    roads_gdf=ROADS
                 )
                 image_urls["flag_map"] = {
                     "url": url_for("output_file", filename=flag_name),
