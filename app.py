@@ -14,23 +14,8 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 try:
     import rasterio
     from rasterio.warp import reproject, Resampling
-    from rasterio.transform import array_bounds
-except Exception as e:
-    print(f"DEBUG: rasterio import failed: {e}")
+except Exception:
     rasterio = None
-
-try:
-    import geopandas as gpd
-    print("DEBUG: geopandas imported successfully")
-except Exception as e:
-    print(f"DEBUG: geopandas import failed: {e}")
-    gpd = None
-
-try:
-    from shapely.geometry import box
-except Exception as e:
-    print(f"DEBUG: shapely import failed: {e}")
-    box = None
 
 
 app = Flask(__name__)
@@ -73,7 +58,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 MODEL_DIR = os.path.join(DATA_DIR, "models")
 RASTER_DIR = os.path.join(DATA_DIR, "rasters")
-ROADS_DIR = os.path.join(DATA_DIR, "roads")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -90,8 +74,6 @@ SOL_Z_TIF = os.path.join(RASTER_DIR, "sr_z_orange.tif")
 ROUGHNESS_TIF = os.path.join(RASTER_DIR, "surface_roughness.tif")
 ELEV_TIF = os.path.join(RASTER_DIR, "terrain.tif")
 
-ROADS_SHP = os.path.join(ROADS_DIR, "roads.shp")
-
 ATOBS_FEATURES = [
     "era_tair_C_at_obs",
     "era_dpt_C_at_obs",
@@ -104,7 +86,6 @@ ATOBS_FEATURES = [
 # ================================
 MODELS = None
 RASTERS = None
-ROADS = None
 
 # ================================
 # Integrated HTML template
@@ -636,85 +617,12 @@ def load_rasters():
     return rasters
 
 
-def load_roads(template_meta):
-    if gpd is None:
-        print("DEBUG: geopandas not available")
-        return None
-
-    print(f"DEBUG: looking for roads at: {ROADS_SHP}")
-    print(f"DEBUG: roads exists? {os.path.exists(ROADS_SHP)}")
-
-    if not os.path.exists(ROADS_SHP):
-        return None
-
-    try:
-        roads = gpd.read_file(ROADS_SHP)
-        print(f"DEBUG: roads loaded, feature count = {len(roads)}")
-        print(f"DEBUG: roads CRS before reprojection = {roads.crs}")
-    except Exception as e:
-        print(f"DEBUG: failed reading roads shapefile: {e}")
-        return None
-
-    if roads.empty:
-        print("DEBUG: roads layer is empty after read")
-        return None
-
-    target_crs = template_meta.get("crs", None)
-    print(f"DEBUG: raster CRS = {target_crs}")
-
-    if target_crs is None:
-        print("DEBUG: raster CRS is None, returning roads without reprojection")
-        return roads
-
-    if roads.crs is None:
-        print("DEBUG: roads CRS is None, skipping reprojection")
-        return roads
-
-    try:
-        if roads.crs != target_crs:
-            roads = roads.to_crs(target_crs)
-            print("DEBUG: roads successfully reprojected to raster CRS")
-    except Exception as e:
-        print(f"DEBUG: reprojection failed: {e}")
-        print("DEBUG: returning unclipped/unreprojected roads")
-        return roads
-
-    if box is not None:
-        try:
-            west, south, east, north = array_bounds(
-                template_meta["height"],
-                template_meta["width"],
-                template_meta["transform"]
-            )
-            bbox = box(west, south, east, north)
-            print(f"DEBUG: raster bounds = {(west, south, east, north)}")
-
-            try:
-                roads = roads.clip(bbox)
-                print(f"DEBUG: roads count after clip = {len(roads)}")
-            except Exception as e:
-                print(f"DEBUG: clip failed, using intersects fallback: {e}")
-                roads = roads[roads.intersects(bbox)]
-                print(f"DEBUG: roads count after intersects fallback = {len(roads)}")
-        except Exception as e:
-            print(f"DEBUG: clipping step failed: {e}")
-            return roads
-
-    if roads.empty:
-        print("DEBUG: roads layer is empty after clipping")
-        return None
-
-    return roads
-
-
 def ensure_loaded():
-    global MODELS, RASTERS, ROADS
+    global MODELS, RASTERS
     if MODELS is None:
         MODELS = load_models()
     if RASTERS is None:
         RASTERS = load_rasters()
-    if ROADS is None:
-        ROADS = load_roads(RASTERS["meta"])
 
 
 def align_to_template(src_arr, src_meta, tmpl_meta, resampling=Resampling.bilinear):
@@ -908,41 +816,9 @@ def wbgt_from_fields(tair_c, td_c, solar_wm2, pair_mb, speed_ms, dt_local, lat=S
     return wbgt_k, tg_k, tnw_k
 
 
-def plot_roads(ax, roads_gdf):
-    if roads_gdf is None:
-        return
-    try:
-        roads_gdf.plot(
-            ax=ax,
-            color="black",
-            linewidth=0.8,
-            alpha=1.0,
-            zorder=10
-        )
-    except Exception as e:
-        print(f"DEBUG: roads plot failed: {e}")
-
-
-def save_map(arr, title, out_path, meta=None, roads_gdf=None, cmap="Greys"):
+def save_map(arr, title, out_path, cmap="viridis"):
     fig, ax = plt.subplots(figsize=(7, 6))
-
-    if meta is not None and rasterio is not None:
-        west, south, east, north = array_bounds(
-            meta["height"],
-            meta["width"],
-            meta["transform"]
-        )
-        im = ax.imshow(
-            arr,
-            cmap=cmap,
-            extent=[west, east, south, north],
-            origin="upper"
-        )
-    else:
-        im = ax.imshow(arr, cmap=cmap)
-
-    plot_roads(ax, roads_gdf)
-
+    im = ax.imshow(arr, cmap=cmap)
     ax.set_title(title)
     ax.set_xticks([])
     ax.set_yticks([])
@@ -952,7 +828,7 @@ def save_map(arr, title, out_path, meta=None, roads_gdf=None, cmap="Greys"):
     plt.close(fig)
 
 
-def save_flag_map(wbgt_array, out_path, unit="C", meta=None, roads_gdf=None):
+def save_flag_map(wbgt_array, out_path, unit="C"):
     if unit.upper() == "F":
         bounds = [0, 80, 85, 88, 90, 120]
         title = "WBGT Flag Levels (°F)"
@@ -965,25 +841,7 @@ def save_flag_map(wbgt_array, out_path, unit="C", meta=None, roads_gdf=None):
     norm = BoundaryNorm(bounds, cmap.N)
 
     fig, ax = plt.subplots(figsize=(7, 6))
-
-    if meta is not None and rasterio is not None:
-        west, south, east, north = array_bounds(
-            meta["height"],
-            meta["width"],
-            meta["transform"]
-        )
-        im = ax.imshow(
-            wbgt_array,
-            cmap=cmap,
-            norm=norm,
-            extent=[west, east, south, north],
-            origin="upper"
-        )
-    else:
-        im = ax.imshow(wbgt_array, cmap=cmap, norm=norm)
-
-    plot_roads(ax, roads_gdf)
-
+    im = ax.imshow(wbgt_array, cmap=cmap, norm=norm)
     ax.set_title(title)
     ax.set_xticks([])
     ax.set_yticks([])
@@ -1054,11 +912,6 @@ def index():
 
             ensure_loaded()
 
-            print("DEBUG: ROADS is None?", ROADS is None)
-            if ROADS is not None:
-                print("DEBUG: loaded road features =", len(ROADS))
-                print("DEBUG: loaded road CRS =", ROADS.crs)
-
             unit_system = form_data["unit_system"]
 
             era_tair_in = float(form_data["era_tair"])
@@ -1067,6 +920,7 @@ def index():
             era_cloud = float(form_data["era_cloud"])
             ref_pressure_mb = float(form_data["ref_pressure_mb"])
 
+            # Convert user inputs to internal SI/Celsius units
             if unit_system == "F":
                 era_tair = f_to_c(era_tair_in)
                 era_dpt = f_to_c(era_dpt_in)
@@ -1140,6 +994,7 @@ def index():
 
             image_urls = {}
 
+            # Convert export maps to selected unit system
             if unit_system == "F":
                 temp_map_display = c_to_f(temp_map_c)
                 dew_map_display = c_to_f(dew_map_c) if dew_map_c is not None else None
@@ -1154,8 +1009,6 @@ def index():
                 temp_map_display,
                 f"Temperature ({temp_unit})",
                 os.path.join(OUTPUT_DIR, temp_name),
-                meta=RASTERS["meta"],
-                roads_gdf=ROADS,
                 cmap="coolwarm"
             )
             image_urls["temp_map"] = {
@@ -1169,8 +1022,6 @@ def index():
                     dew_map_display,
                     f"Dew Point ({temp_unit})",
                     os.path.join(OUTPUT_DIR, dew_name),
-                    meta=RASTERS["meta"],
-                    roads_gdf=ROADS,
                     cmap="BrBG"
                 )
                 image_urls["dew_map"] = {
@@ -1184,9 +1035,7 @@ def index():
                     sol_map,
                     "Solar Radiation (W/m²)",
                     os.path.join(OUTPUT_DIR, sol_name),
-                    meta=RASTERS["meta"],
-                    roads_gdf=ROADS,
-                    cmap="Reds"
+                    cmap="inferno"
                 )
                 image_urls["sol_map"] = {
                     "url": url_for("output_file", filename=sol_name),
@@ -1199,9 +1048,7 @@ def index():
                     u2_map_display,
                     f"Wind Speed at 2 m ({wind_unit})",
                     os.path.join(OUTPUT_DIR, wind_name),
-                    meta=RASTERS["meta"],
-                    roads_gdf=ROADS,
-                    cmap="Blues"
+                    cmap="viridis"
                 )
                 image_urls["u2_map"] = {
                     "url": url_for("output_file", filename=wind_name),
@@ -1214,9 +1061,7 @@ def index():
                     pressure_map,
                     "Surface Pressure (mb)",
                     os.path.join(OUTPUT_DIR, pressure_name),
-                    meta=RASTERS["meta"],
-                    roads_gdf=ROADS,
-                    cmap="Greys"
+                    cmap="viridis"
                 )
                 image_urls["pressure_map"] = {
                     "url": url_for("output_file", filename=pressure_name),
@@ -1232,6 +1077,7 @@ def index():
 
             wbgt_warning = None
 
+            # Summary display values
             if unit_system == "F":
                 temp_min_display = c_to_f(t_min_c)
                 temp_max_display = c_to_f(t_max_c)
@@ -1302,8 +1148,6 @@ def index():
                     wbgt_display,
                     f"WBGT ({temp_unit})",
                     os.path.join(OUTPUT_DIR, wbgt_name),
-                    meta=RASTERS["meta"],
-                    roads_gdf=ROADS,
                     cmap="bwr"
                 )
                 image_urls["wbgt_map"] = {
@@ -1316,8 +1160,6 @@ def index():
                     tg_display,
                     f"Black Globe Temperature ({temp_unit})",
                     os.path.join(OUTPUT_DIR, tg_name),
-                    meta=RASTERS["meta"],
-                    roads_gdf=ROADS,
                     cmap="Reds"
                 )
                 image_urls["tg_map"] = {
@@ -1330,8 +1172,6 @@ def index():
                     tnw_display,
                     f"Natural Wet Bulb Temperature ({temp_unit})",
                     os.path.join(OUTPUT_DIR, tnw_name),
-                    meta=RASTERS["meta"],
-                    roads_gdf=ROADS,
                     cmap="BrBG"
                 )
                 image_urls["tnw_map"] = {
@@ -1343,9 +1183,7 @@ def index():
                 save_flag_map(
                     wbgt_display,
                     os.path.join(OUTPUT_DIR, flag_name),
-                    unit=flag_unit,
-                    meta=RASTERS["meta"],
-                    roads_gdf=ROADS
+                    unit=flag_unit
                 )
                 image_urls["flag_map"] = {
                     "url": url_for("output_file", filename=flag_name),
@@ -1365,7 +1203,6 @@ def index():
 
         except Exception as e:
             error = str(e)
-            print(f"DEBUG: app error = {e}")
 
     return render_template_string(
         HTML_TEMPLATE,
