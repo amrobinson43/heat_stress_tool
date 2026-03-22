@@ -337,7 +337,7 @@ HTML_TEMPLATE = """
                 </p>
 
                 <p>
-                    The results generated using machine-learning models trained on observations collected during the summer 2025 Southeast Regional Climate Center citizen-science campaign
+                    The results generated using machine-learning models trained on observations collected during the summer 2025 Southeast Regional Climate Center citizen-science campaign.
                     This campaign used walking, cycling, and driving mobile transects to capture fine-scale spatial variability across the urban landscape. For each meteorological
                     variable, the machine-learning models predict the day-specific minimum and maximum conditions expected across the study area from
                     the at-observation ambient inputs entered below. Precomputed raster surfaces derived from the transect data preserve the observed
